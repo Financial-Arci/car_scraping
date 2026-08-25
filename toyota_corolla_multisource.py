@@ -1520,7 +1520,7 @@ async def main():
     print(f"✅ Combined raw data saved to {csv_path}")
 
     html = build_dashboard(df)
-    out_path = Path("toyota_corolla_dashboard.html")
+    out_path = Path("index.html")
     out_path.write_text(html, encoding="utf-8")
     print(f"✅ Dashboard saved to {out_path.resolve()}")
 
