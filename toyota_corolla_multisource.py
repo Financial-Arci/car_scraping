@@ -59,7 +59,22 @@ from playwright.async_api import async_playwright
 AUTOSCOUT_BASE_URL = "https://www.autoscout24.be"
 TWEEDEHANDS_BASE_URL = "https://www.2ememain.be"
 
-SELLER_TYPE_MAP = {"d": "Professionnel"}   # DOM-code fallback only; JSON-LD is preferred now
+SELLER_TYPE_MAP = {"d": "Professionnel", "p": "Particulier"}   # [Likely] "p" now inferred from the
+# customerType taxonomy (P=Particulier, D=Professionnel) in the NEXT_DATA payload; DOM-code
+# fallback only — NEXT_DATA/JSON-LD's own seller.type field is preferred and unambiguous.
+
+FUEL_CODE_MAP = {   # [Certain] — confirmed via NEXT_DATA's own taxonomy.fuelType list
+    "2": "Electrique/Essence",
+    "3": "Electrique/Diesel",
+    "B": "Essence",
+    "C": "CNG",
+    "D": "Diesel",
+    "E": "Electrique",
+    "H": "Hydrogène",
+    "L": "GPL",
+    "M": "Ethanol",
+    "O": "Autres",
+}
 
 GEONAMES_BE_ZIP_URL = "https://download.geonames.org/export/zip/BE.zip"
 POSTAL_CACHE_PATH = Path("be_postal_codes.csv")
@@ -124,6 +139,12 @@ def map_seller_type(code: str | None) -> str | None:
     return SELLER_TYPE_MAP.get(code.lower(), f"Inconnu ({code})")
 
 
+def map_fuel_code(code: str | None) -> str | None:
+    if not code:
+        return None
+    return FUEL_CODE_MAP.get(code.upper(), f"Inconnu ({code})")
+
+
 def load_belgian_postal_codes() -> dict:
     if not POSTAL_CACHE_PATH.exists():
         print("📮 Downloading Belgian postal code coordinates (GeoNames, one-time)...")
@@ -183,6 +204,11 @@ def build_autoscout_url(filters: dict, page: int) -> str:
     if filters.get("km_max"):     params["kmto"]      = filters["km_max"]
     if filters.get("year_min"):   params["fregfrom"]  = filters["year_min"]
     if filters.get("year_max"):   params["fregto"]    = filters["year_max"]
+    if filters.get("adage"):      params["adage"]     = filters["adage"]
+    # [Likely, not independently verified] "adage" = days since listed,
+    # inferred from the taxonomy.onlineSince block (1-6, 7, 14) matching
+    # your captured URL exactly. Per your own testing, it's inclusive
+    # (adage=3 returns 1+2+3 day-old listings together).
     params["sort"] = "standard"
     params["desc"] = "0"
     params["ustate"] = "N,U"
@@ -203,44 +229,68 @@ def detect_body_type_heuristic(title: str | None) -> str:
     return "Berline / 5 portes (non détecté comme break)"
 
 
-async def diagnose_next_data(page, already_printed: list) -> None:
+async def extract_nextdata_listings(page) -> dict:
     """
-    [Diagnostic only — not wired into scraping yet.] AutoScout24 runs on
-    Next.js and embeds a <script id="__NEXT_DATA__"> tag with the full
-    page payload, including props.pageProps.listings (a richer, more
-    complete source than the JSON-LD block — confirmed to exist by an
-    independent technical write-up, but I don't have the exact field
-    names for things like a real "listed since" date confirmed). This
-    prints the key structure of one listing so we can find that field
-    (and anything else useful) without guessing blindly. Runs once only.
+    {guid: {...}} parsed from Next.js's <script id="__NEXT_DATA__"> payload.
+    [Certain, confirmed by real captured HTML] — richer than the JSON-LD
+    block: also gives real body type (vehicle.variant, not a title guess),
+    leads range, zip/city, first registration, and new/used car status
+    (vehicle.offerType), so DOM scraping below becomes a genuine fallback
+    rather than the norm. Does NOT include the "Nouveau" recency badge —
+    that's rendered client-side only and stays DOM-sourced, see below.
     """
-    if already_printed:
-        return
+    result = {}
+    script = await page.query_selector("script#__NEXT_DATA__")
+    if not script:
+        return result
     try:
-        script = await page.query_selector("script#__NEXT_DATA__")
-        if not script:
-            print("ℹ __NEXT_DATA__ script tag not found on this page.")
-            already_printed.append(True)
-            return
         raw = await script.text_content()
         data = json.loads(raw)
-        listings = (data.get("props", {}) or {}).get("pageProps", {}).get("listings")
-        if not listings:
-            print("ℹ __NEXT_DATA__ found but props.pageProps.listings is empty/absent "
-                  "(shape may differ from what's documented).")
-            already_printed.append(True)
-            return
-        sample = listings[0]
-        print("\nℹ __NEXT_DATA__ diagnostic — top-level keys of one listing:")
-        print("   ", list(sample.keys()))
-        for k, v in sample.items():
-            if isinstance(v, dict):
-                print(f"    {k} (nested):", list(v.keys()))
-        print("  → If you spot a date/'online since'/'created'/'published'-looking key "
-              "above, tell me which one and I'll wire it in properly.\n")
-    except Exception as exc:
-        print(f"  ⚠ __NEXT_DATA__ diagnostic failed: {exc}")
-    already_printed.append(True)
+    except Exception:
+        return result
+
+    listings = (((data.get("props") or {}).get("pageProps") or {}).get("listings")) or []
+    for item in listings:
+        guid = item.get("id")
+        if not guid:
+            continue
+        vehicle = item.get("vehicle") or {}
+        price = item.get("price") or {}
+        location = item.get("location") or {}
+        seller = item.get("seller") or {}
+        tracking = item.get("tracking") or {}
+        statistics = item.get("statistics") or {}
+        url = item.get("url")
+
+        seller_type_raw2 = seller.get("type")   # "Dealer" / "PrivateSeller"
+        seller_type = ("Professionnel" if seller_type_raw2 == "Dealer"
+                        else "Particulier" if seller_type_raw2 == "PrivateSeller" else None)
+
+        offer_type = vehicle.get("offerType")    # "N" new car / "U" used car
+        condition = "Neuf" if offer_type == "N" else ("Occasion" if offer_type == "U" else None)
+
+        title_bits = [vehicle.get("make"), vehicle.get("model"), vehicle.get("modelVersionInput")]
+        title = " ".join(b for b in title_bits if b).strip() or None
+
+        result[guid] = {
+            "url":               (AUTOSCOUT_BASE_URL + url) if url and url.startswith("/") else url,
+            "title":             title,
+            "km":                parse_number(tracking.get("mileage")),
+            "fuel":              vehicle.get("fuel"),
+            "fuel_code":         tracking.get("fuelType"),
+            "gear":              vehicle.get("transmission"),
+            "body_type":         vehicle.get("variant"),   # e.g. "Touring Sports", "Hatchback 5-Door"
+            "price":             price.get("priceRaw"),
+            "price_label":       tracking.get("priceLabel"),
+            "seller_type":       seller_type,
+            "seller_name":       seller.get("companyName"),
+            "zip_code":          location.get("zip"),
+            "city":              location.get("city"),
+            "first_registration": tracking.get("firstRegistration"),
+            "condition":         condition,
+            "leads_range":       statistics.get("leadsRange"),
+        }
+    return result
 
 
 async def extract_jsonld_listings(page) -> dict:
@@ -296,11 +346,16 @@ async def extract_jsonld_listings(page) -> dict:
     return result
 
 
-async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list[dict]:
+async def scrape_autoscout_page(page, url: str) -> list[dict]:
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     await page.wait_for_timeout(random.randint(3000, 5500))
 
-    await diagnose_next_data(page, next_data_printed)
+    # Source priority: __NEXT_DATA__ (richest, confirmed real) > JSON-LD
+    # (confirmed real, narrower) > DOM attributes/pills (always-available
+    # fallback). All three are merged per-field, not all-or-nothing per
+    # listing, so a listing missing from one source can still pick up
+    # individual fields from another.
+    nextdata_map = await extract_nextdata_listings(page)
     jsonld_map = await extract_jsonld_listings(page)
 
     articles = await page.query_selector_all("article[data-guid]")
@@ -308,23 +363,24 @@ async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list
         articles = await page.query_selector_all("article")
 
     rows = []
-    n_from_jsonld = 0
+    n_from_nextdata = 0
     for art in articles:
         try:
             guid = await art.get_attribute("data-guid") or ""
-            jl = jsonld_map.get(guid)
+            nd = nextdata_map.get(guid) or {}
+            jl = jsonld_map.get(guid) or {}
 
             first_reg     = await art.get_attribute("data-first-registration")
             make_attr     = await art.get_attribute("data-make")
             model_attr    = await art.get_attribute("data-model")
             zip_code      = await art.get_attribute("data-listing-zip-code")
             country       = await art.get_attribute("data-listing-country")
-            fuel_code     = await art.get_attribute("data-fuel-type")
-            price_label   = await art.get_attribute("data-price-label")
+            fuel_code_dom = await art.get_attribute("data-fuel-type")
+            price_label_dom = await art.get_attribute("data-price-label")
             seller_type_r = await art.get_attribute("data-seller-type")
-            leads_range   = await art.get_attribute("data-leads-range")
+            leads_range_dom = await art.get_attribute("data-leads-range")
 
-            # DOM fallback fields (used only if JSON-LD lacks this guid)
+            # DOM fallback fields (used only when neither structured source has them)
             title_short_el = await art.query_selector("[class*='ListItemTitle_title__']")
             title_sub_el   = await art.query_selector("[class*='ListItemTitle_subtitle__']")
             title_short = (await title_short_el.text_content() or "").strip() if title_short_el else ""
@@ -348,8 +404,16 @@ async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list
                 return None
 
             date_text = pill("calendar")
-            condition_el = await art.query_selector("[class*='ListItemPill_pill--highlight__']")
-            condition_dom = (await condition_el.text_content() or "").strip() if condition_el else None
+
+            # ── "Nouveau" badge — AD RECENCY, kept fully separate from
+            # car condition (new-car vs used-car). Per your info this
+            # means the ad itself was added within the last 24h. This is
+            # a highlight pill with NO data-testid, so it's not part of
+            # the `pills` dict above — queried directly here, always,
+            # regardless of which source matched everything else.
+            badge_el = await art.query_selector("[class*='ListItemPill_pill--highlight__']")
+            badge_text = (await badge_el.text_content() or "").strip() if badge_el else None
+            is_newly_listed = bool(badge_text and "nouveau" in badge_text.lower())
 
             price_el_dom = await art.query_selector("[data-testid='regular-price']")
             price_dom = parse_number((await price_el_dom.text_content()) if price_el_dom else None)
@@ -358,26 +422,39 @@ async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list
             href_dom = await link_el_dom.get_attribute("href") if link_el_dom else None
             url_dom = (AUTOSCOUT_BASE_URL + href_dom) if href_dom and href_dom.startswith("/") else href_dom
 
-            # ── Prefer JSON-LD, fall back to DOM per-field ──────────────
-            title = (jl or {}).get("title") or title_dom
-            price = (jl or {}).get("price") or price_dom
-            km    = (jl or {}).get("km") or km_dom
-            fuel  = (jl or {}).get("fuel") or pill("gas_pump", "fuel")
-            gear  = (jl or {}).get("gear") or pill("gearbox", "transmission")
-            listing_url = (jl or {}).get("url") or url_dom
-            seller_type = (jl or {}).get("seller_type") or map_seller_type(seller_type_r)
-            seller_name = (jl or {}).get("seller_name")
-            seller_location = (jl or {}).get("seller_location")
-            condition_raw = (jl or {}).get("condition_raw") or ""
-            if "NewCondition" in condition_raw:
-                condition = "Neuf"
-            elif "UsedCondition" in condition_raw:
-                condition = "Occasion"
-            else:
-                condition = condition_dom
+            # ── Merge: NEXT_DATA > JSON-LD > DOM, per field ─────────────
+            title = nd.get("title") or jl.get("title") or title_dom
+            price = nd.get("price") or jl.get("price") or price_dom
+            km    = nd.get("km") or jl.get("km") or km_dom
+            fuel  = nd.get("fuel") or jl.get("fuel") or pill("gas_pump", "fuel")
+            gear  = nd.get("gear") or jl.get("gear") or pill("gearbox", "transmission")
+            listing_url = nd.get("url") or jl.get("url") or url_dom
+            seller_type = nd.get("seller_type") or jl.get("seller_type") or map_seller_type(seller_type_r)
+            seller_name = nd.get("seller_name") or jl.get("seller_name")
+            price_label = nd.get("price_label") or price_label_dom
+            fuel_code   = nd.get("fuel_code") or fuel_code_dom
+            leads_range = nd.get("leads_range") or leads_range_dom
+            zip_code    = nd.get("zip_code") or zip_code
+            city        = nd.get("city")
+            first_reg   = nd.get("first_registration") or first_reg
 
-            if jl:
-                n_from_jsonld += 1
+            condition = nd.get("condition")   # new/used CAR, from vehicle.offerType — [Certain]
+            if condition is None:
+                condition_raw = jl.get("condition_raw") or ""
+                if "NewCondition" in condition_raw:
+                    condition = "Neuf"
+                elif "UsedCondition" in condition_raw:
+                    condition = "Occasion"
+
+            body_type = nd.get("body_type")   # real, e.g. "Touring Sports" — [Certain] when present
+            if body_type:
+                body_type_confidence = "direct"
+            else:
+                body_type = detect_body_type_heuristic(title)
+                body_type_confidence = "heuristic"
+
+            if nd:
+                n_from_nextdata += 1
             if price is None and not title:
                 continue
 
@@ -391,6 +468,7 @@ async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list
                 "first_registration":   first_reg,
                 "year_raw":             date_text or first_reg,
                 "fuel_code":            fuel_code,
+                "fuel_code_label":      map_fuel_code(fuel_code),
                 "fuel":                 fuel,
                 "gear":                 gear,
                 "condition":            condition,
@@ -399,23 +477,27 @@ async def scrape_autoscout_page(page, url: str, next_data_printed: list) -> list
                 "leads_range":          leads_range,
                 "zip_code":             zip_code,
                 "is_sport":             has_sport_trim(title),
-                "body_type":            detect_body_type_heuristic(title),
-                "body_type_confidence": "heuristic",
+                "body_type":            body_type,
+                "body_type_confidence": body_type_confidence,
                 "make":                 make_attr,
                 "model":                model_attr,
                 "seller_name":          seller_name,
-                "location":             seller_location or (f"{country.upper()}-{zip_code}" if country and zip_code else None),
+                "location":             city or (f"{country.upper()}-{zip_code}" if country and zip_code else None),
                 "url":                  listing_url,
-                "posted_text":          None,
-                "data_source_detail":   "jsonld" if jl else "dom_fallback",
+                # ── Recency: real site data now, not scraper-tracked ──
+                "is_recent":            is_newly_listed,
+                "recency_label":        "Nouveau (<1 jour)" if is_newly_listed else "Non signalé comme récent",
+                "recency_bucket":       "Nouveau (<1 jour)" if is_newly_listed else "Non signalé comme récent",
+                "recency_reliable":     True,
+                "data_source_detail":   "nextdata" if nd else ("jsonld" if jl else "dom_fallback"),
                 "scraped_at":           datetime.now().isoformat(),
             })
         except Exception as exc:
             print(f"  ⚠ Listing parse error: {exc}")
             continue
 
-    print(f"    ↳ {n_from_jsonld}/{len(articles)} listings matched via JSON-LD "
-          f"(the rest used DOM fallback)")
+    print(f"    ↳ {n_from_nextdata}/{len(articles)} listings matched via __NEXT_DATA__ "
+          f"(richest source; rest used JSON-LD or DOM fallback)")
     return rows
 
 
@@ -425,7 +507,6 @@ async def scrape_autoscout(filters: dict, max_pages: int = 8) -> pd.DataFrame:
 
     all_rows: list[dict] = []
     seen_guids: set[str] = set()
-    next_data_printed: list = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -456,7 +537,7 @@ async def scrape_autoscout(filters: dict, max_pages: int = 8) -> pd.DataFrame:
             url = build_autoscout_url(filters, page_num)
             print(f"  Page {page_num}: {url}")
             try:
-                rows = await scrape_autoscout_page(page, url, next_data_printed)
+                rows = await scrape_autoscout_page(page, url)
             except Exception as exc:
                 print(f"  ✗ Page {page_num} failed: {exc}")
                 await page.screenshot(path=f"debug_autoscout_p{page_num}.png")
@@ -493,56 +574,19 @@ async def scrape_autoscout(filters: dict, max_pages: int = 8) -> pd.DataFrame:
     df = df.dropna(subset=["price"])
     df = df[df["price"] > 500]
 
-    # NOTE — honesty fix: AutoScout24 does not expose a real "listed
-    # since" date anywhere I've confirmed yet (not in the JSON-LD block;
-    # the __NEXT_DATA__ diagnostic above is trying to find one). This is
-    # NOT a substitute for that — it only tracks when *this scraper*
-    # first saw the guid, across runs, via listing_history.json. On a
-    # fresh history file (first run, or a deleted file, or a different
-    # working directory) every row will show "0 jours" — that is
-    # expected, not evidence the listing is actually new. Treat this as
-    # weak/unreliable until real posting-date data is wired in.
-    history = load_history()
-    now = datetime.now()
-    now_iso = now.isoformat()
-    first_seen_list, is_recent_list, recency_label_list = [], [], []
-    for guid in df["guid"]:
-        key = f"autoscout24:{guid}"
-        if key not in history:
-            history[key] = now_iso
-        first_seen = history[key]
-        try:
-            days_ago = (now - datetime.fromisoformat(first_seen)).days
-        except ValueError:
-            days_ago = 0
-        first_seen_list.append(first_seen)
-        is_recent_list.append(days_ago <= RECENT_WINDOW_DAYS)
-        recency_label_list.append(
-            f"Vu par le scraper depuis {days_ago}j (PAS la date de publication réelle)"
-        )
-    df["first_seen_at"] = first_seen_list
-    df["is_recent"] = is_recent_list
-    df["recency_label"] = recency_label_list
-    df["recency_reliable"] = False
+    # Recency is now set per-row in scrape_autoscout_page() from the real
+    # "Nouveau" badge (is_recent / recency_label / recency_bucket /
+    # recency_reliable are already populated — no history-file guessing
+    # needed anymore). If you also want the "En ligne depuis" server-side
+    # filter (adage=N), pass adage in `filters` before calling this.
 
-    def bucket_days(days_ago: int) -> str:
-        if days_ago <= 1:
-            return "Vu il y a 0-1j (scraper, peu fiable)"
-        elif days_ago <= 7:
-            return "Vu il y a 2-7j (scraper, peu fiable)"
-        return "Vu il y a 8j+ (scraper, peu fiable)"
-
-    df["recency_bucket"] = [
-        bucket_days((now - datetime.fromisoformat(fs)).days) for fs in first_seen_list
-    ]
-    save_history(history)
-
-    n_jsonld = int((df["data_source_detail"] == "jsonld").sum())
-    print(f"\n✅ {len(df)} clean AutoScout24 listings. {n_jsonld}/{len(df)} sourced from JSON-LD "
-          f"(the reliable path); {len(df) - n_jsonld} used DOM fallback.")
-    if len(history) <= len(df):
-        print("ℹ First run — every listing marked as newly seen. Expected; "
-              "recency becomes meaningful from the next run onward.\n")
+    n_nextdata = int((df["data_source_detail"] == "nextdata").sum())
+    n_jsonld   = int((df["data_source_detail"] == "jsonld").sum())
+    n_dom      = len(df) - n_nextdata - n_jsonld
+    n_new_badge = int(df["is_recent"].sum())
+    print(f"\n✅ {len(df)} clean AutoScout24 listings. "
+          f"{n_nextdata} from __NEXT_DATA__, {n_jsonld} from JSON-LD, {n_dom} DOM-only fallback.")
+    print(f"ℹ {n_new_badge} listing(s) carry the 'Nouveau' badge (<1 day old, per your info).\n")
 
     return df
 
@@ -561,12 +605,19 @@ ICON_FIELD_MAP_2M = {
 
 
 def build_2ememain_url(page: int = 1, construction_year_from: int | None = None) -> str:
+    """
+    [Testing a hypothesis, not yet confirmed] Switched from a ?page=N query
+    param (confirmed NOT to work — caused the hydration-reset stall seen in
+    the last run) to a /p/N/ path segment, which matches this site's own
+    convention of using path segments for filters (e.g. /f/corolla/1230/).
+    The stall-detector below will confirm or refute this on the next run.
+    """
     base = f"{TWEEDEHANDS_BASE_URL}/l/autos/toyota/f/corolla/1230/"
-    qs = f"?page={page}" if page > 1 else ""
+    path_suffix = f"p/{page}/" if page > 1 else ""
     frag = "#q:toyota+corolla|Language:all-languages"
     if construction_year_from:
         frag += f"|constructionYearFrom:{construction_year_from}"
-    return f"{base}{qs}{frag}"
+    return f"{base}{path_suffix}{frag}"
 
 
 async def parse_2ememain_card(a_handle) -> dict | None:
@@ -653,7 +704,21 @@ async def parse_2ememain_card(a_handle) -> dict | None:
     }
 
 
-async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 20) -> pd.DataFrame:
+async def extract_total_results(page) -> int | None:
+    """Parses the site's own 'X résultats' breadcrumb text so we can report
+    collected-vs-total honestly instead of leaving it to guesswork."""
+    try:
+        text = await page.inner_text("body")
+        m = re.search(r"([\d.,]+)\s*résultats?", text)
+        if m:
+            n = parse_number(m.group(1))
+            return int(n) if n else None
+    except Exception:
+        pass
+    return None
+
+
+async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 25) -> pd.DataFrame:
     print(f"\n🚗 Scraping 2ememain.be — Toyota Corolla, from {construction_year_from}\n")
 
     async with async_playwright() as pw:
@@ -668,12 +733,14 @@ async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 2
         rows = []
         seen_ids = set()
         n_dropped_incomplete = 0
+        total_results = None
+        prev_first_id = None
+        stalled_pages = 0
 
         for page_num in range(1, max_pages + 1):
             url = build_2ememain_url(page_num, construction_year_from)
             print(f"  Page {page_num}: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(random.randint(1500, 2500))
 
             if page_num == 1:
                 for selector in ["button#didomi-notice-agree-button", "#onetrust-accept-btn-handler",
@@ -687,6 +754,38 @@ async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 2
                             break
                     except Exception:
                         pass
+                total_results = await extract_total_results(page)
+                if total_results:
+                    print(f"  ℹ Site reports {total_results} total results for this search.")
+
+            # Poll for the listing grid to actually reflect this page rather
+            # than trusting a fixed timeout — guards against the hydration-
+            # reset scenario (client-side JS silently reverting to page 1's
+            # data after navigation).
+            first_id_this_page = None
+            for _ in range(6):
+                await page.wait_for_timeout(700)
+                anchors_probe = await page.query_selector_all("a[href*='/v/autos/']")
+                if anchors_probe:
+                    href0 = await anchors_probe[0].get_attribute("href")
+                    id0_m = re.search(r"/m(\d+)-", href0 or "")
+                    first_id_this_page = id0_m.group(1) if id0_m else href0
+                    break
+
+            if page_num > 1 and first_id_this_page == prev_first_id:
+                stalled_pages += 1
+                print(f"    ⚠ First listing on this page is IDENTICAL to the previous page "
+                      f"({first_id_this_page}). This looks like the hydration-reset issue, "
+                      f"not end-of-results — page param isn't sticking client-side.")
+                if stalled_pages >= 2:
+                    print("  ✗ Stalled twice in a row — stopping. This confirms the pagination "
+                          "mechanism needs a different approach (e.g. clicking an in-page "
+                          "'next' control instead of a fresh URL per page). Tell me and I'll "
+                          "rework it rather than guess a third time.")
+                    break
+            else:
+                stalled_pages = 0
+            prev_first_id = first_id_this_page
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1000)
@@ -712,12 +811,11 @@ async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 2
                     print(f"  ⚠ 2ememain listing parse error: {exc}")
                     continue
 
-            print(f"    → {new_ids_this_page} new usable listings ({len(anchors)} links seen on page)")
+            print(f"    → {new_ids_this_page} new usable listings ({len(anchors)} links seen on page, "
+                  f"{len(seen_ids)} unique so far)")
 
-            if new_ids_this_page == 0:
-                print("  ✓ No new listings on this page — stopping "
-                      "(either end of results or the page param isn't being respected; "
-                      "check the count below against the site's own total).")
+            if new_ids_this_page == 0 and stalled_pages == 0:
+                print("  ✓ No new listings and no stall detected — genuine end of results.")
                 break
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
@@ -729,7 +827,8 @@ async def scrape_2ememain(construction_year_from: int = 2019, max_pages: int = 2
 
     df = pd.DataFrame(rows)
     df = df[df["price"] > 500]
-    print(f"\n✅ {len(df)} usable 2ememain listings collected "
+    coverage = f" out of ~{total_results} the site reports" if total_results else ""
+    print(f"\n✅ {len(df)} usable 2ememain listings collected{coverage} "
           f"({n_dropped_incomplete} dropped for missing year/mileage/price, as instructed).\n")
     return df
 
@@ -792,10 +891,10 @@ def build_dashboard(df: pd.DataFrame) -> str:
 
     cols = [
         "price", "km", "year", "fuel", "gear", "title", "url", "location",
-        "seller_type", "price_label", "fuel_code", "leads_range",
+        "seller_type", "price_label", "fuel_code", "fuel_code_label", "leads_range",
         "is_sport", "body_type", "body_type_confidence", "zip_code", "lat", "lon",
         "place_name", "source", "is_recent", "recency_label", "recency_bucket",
-        "recency_reliable",
+        "recency_reliable", "condition",
     ]
     export = df[[c for c in cols if c in df.columns]].copy()
     export = export.rename(columns={"zip_code": "zip", "place_name": "place"})
@@ -1092,7 +1191,7 @@ def build_dashboard(df: pd.DataFrame) -> str:
     <select id="f-body" multiple size="4">{multiselect_options(body_type_options)}</select>
   </div>
   <div class="filter-group">
-    <label>Recency <span class="hint">AS24 buckets = scraper-tracked, not real post date</span></label>
+    <label>Recency <span class="hint">AS24 "Nouveau" = &lt;1 day, per site; 2M dates are exact</span></label>
     <select id="f-recency" multiple size="4">{multiselect_options(recency_options)}</select>
   </div>
   <div class="filter-group">
@@ -1116,7 +1215,7 @@ def build_dashboard(df: pd.DataFrame) -> str:
   <div class="kpi">
     <div class="kpi-label">New / Recent</div>
     <div class="kpi-value" id="kpi-recent">{n_recent}</div>
-    <div class="kpi-sub">AS24 = weak signal, see hint</div>
+    <div class="kpi-sub">"Nouveau" badge or 2M same-day</div>
   </div>
   <div class="kpi">
     <div class="kpi-label">Avg Price</div>
@@ -1504,6 +1603,12 @@ async def main():
         "km_max":    100000,
         "year_min":  2019,
         "cy":        "B",
+        # "adage":   3,   # uncomment to restrict AutoScout24 to listings
+                          # posted in the last N days server-side (1-6, 7, 14)
+                          # [Likely, not independently verified] — cheaper
+                          # than scraping everything and filtering after.
+                          # The per-listing "Nouveau" badge (<1 day) is
+                          # captured either way, unaffected by this.
     }
 
     df_autoscout = await scrape_autoscout(autoscout_filters, max_pages=30)
@@ -1520,7 +1625,7 @@ async def main():
     print(f"✅ Combined raw data saved to {csv_path}")
 
     html = build_dashboard(df)
-    out_path = Path("index.html")
+    out_path = Path("index.html")   # matches GitHub Pages' default entry file
     out_path.write_text(html, encoding="utf-8")
     print(f"✅ Dashboard saved to {out_path.resolve()}")
 
